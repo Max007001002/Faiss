@@ -1,0 +1,134 @@
+!pip install -q nest_asyncio xmltodict faiss-cpu==1.7.4 langchain==0.1.7 openai==1.12.0 tiktoken==0.6.0 langchain_community==0.0.20 langchain-openai==0.0.6
+
+# fixes a bug with asyncio and jupyter
+import nest_asyncio
+nest_asyncio.apply()
+import xmltodict
+from langchain.document_loaders.sitemap import SitemapLoader
+import requests
+from langchain.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tiktoken
+import matplotlib.pyplot as plt
+import getpass
+import os
+import openai
+from langchain.vectorstores import FAISS
+import re
+from google.colab import userdata
+from openai import OpenAI
+
+
+
+# Получение ключа API от пользователя и установка его как переменной окружения
+openai_key = userdata.get("OPENAI_API_KEY")
+os.environ["OPENAI_API_KEY"] = openai_key
+openai.api_key = openai_key
+
+
+url = "https://refocus.me/"
+url_site_map = f"{url}/sitemap.xml"
+
+sitemap_loader = SitemapLoader(web_path=url_site_map
+    )
+
+
+# Карту сайта можно посмотреть тут:
+url_site_map
+
+
+# парсим сайт и сразу делим на чанки
+text_splitter_instance = RecursiveCharacterTextSplitter(chunk_size = 2000, separators= ['/n', '.'])
+docs = sitemap_loader.load_and_split(text_splitter=text_splitter_instance)
+
+
+# общее количество чанков
+len(docs)
+
+
+# Посмотрим на первые несколько чанков
+docs[:2]
+
+
+def num_tokens_from_string(string: str, encoding_name: str) -> int:
+      """Возвращает количество токенов в строке"""
+      encoding = tiktoken.get_encoding(encoding_name)
+      num_tokens = len(encoding.encode(string))
+      return num_tokens
+
+# Подсчет токенов для каждого фрагмента и построение графика
+fragment_token_counts = [num_tokens_from_string(fragment.page_content, "cl100k_base") for fragment in docs]
+plt.hist(fragment_token_counts, bins=50, alpha=0.5, label='Fragments')
+plt.title('Распределение длин чанков в токенах')
+plt.xlabel('Token Count')
+plt.ylabel('Frequency')
+plt.show()
+
+
+# Фильтрация чанков с менее чем 60 токенами
+small_chunks = [fragment for fragment in docs if num_tokens_from_string(fragment.page_content, "cl100k_base") < 60]
+print("Количество чанков короче 60 токенов:", len(small_chunks))
+print()
+# Вывод на экран около нулевых чанков
+for fragment in small_chunks:
+    print("Источник:", fragment.metadata["source"])
+    print("Число токенов:", num_tokens_from_string(fragment.page_content, "cl100k_base"))
+    print("Содержимое:")
+    print(fragment.page_content)
+    print("\n")
+
+
+
+# Создаем новый список, в котором будут только чанки с более чем 60 токенами
+filtered_docs = [fragment for fragment in docs if num_tokens_from_string(fragment.page_content, "cl100k_base") >= 60]
+
+# Теперь filtered_docs содержит только чанки с длиной не менее 60 токенов
+
+
+# Инициализирум модель эмбеддингов
+embeddings = OpenAIEmbeddings()
+
+# Создадим индексную базу из разделенных фрагментов текста
+db = FAISS.from_documents(filtered_docs, embeddings)
+
+
+# Пишем промпт в систем на английском языке для экономии токенов
+system="Provide a very comprehensive and detailed response to the user's question, relying explicitly on the document containing the information needed to answer the client in Russian. Avoid making any conjectures or assumptions independently. Avoid direct references to the specific excerpts from the document itself; the client need not be aware of them."
+
+
+def answer_index(system, topic, search_index, temp=0, verbose=0) -> str:
+    """
+    Функция возвращает ответ модели на основе заданной темы.
+    """
+    # находим наиболее релевантные вопросу пользователя чанки:
+    docs = search_index.similarity_search(topic, k=4)
+    message_content = re.sub(r'\n{2}', ' ', '\n '.join([f'\nОтрывок документа №{i+1}\n=====================' + doc.page_content + '\n' for i, doc in enumerate(docs)]))
+    client = OpenAI()
+    # если параметр verbose=1, то выводим релевантные чанки
+    if verbose:
+        print('message_content :\n', message_content)
+
+    messages = [
+        {"role": "system", "content": system},
+        # в user промпт тоже пишем на английском - для экономии токенов
+        {"role": "user", "content": f"Answer the user's question, but do not mention the data or documents with information in your response. Document with information for the user's answer: {message_content}\n\n User's question: \n{topic}"}
+    ]
+
+    completion = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        temperature=temp
+    )
+
+    return completion.choices[0].message.content
+
+
+topic="Чем занимается Refocus Digital Academy?"
+ans=answer_index(system, topic, db, temp=0, verbose=0)
+ans
+
+
+topic="Смогу ли я получить Qualifying Job Offer после учебы?"
+ans=answer_index(system, topic, db, temp=0, verbose=0)
+ans
